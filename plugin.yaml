@@ -1,0 +1,38 @@
+name: decider
+label: Decider
+kind: community
+version: 1.0.0
+author: greqone
+homepage: https://github.com/greqone/hermes-decider
+description: >
+  A delegation backend that asks one local decision model which configured route a subagent should
+  run on. Set delegation.backend to "decider". It calls a single /v1/systemone endpoint you name,
+  the model answers with one of your route names, and the plugin maps that name to the route. If
+  the endpoint is down or the answer is not one of your routes, the task takes the route you marked
+  default. It never falls back to a second host, so task text leaves the machine only for the
+  endpoint you configured.
+requires_hermes: ">=0.22.5"
+provides_tools: []
+provides_hooks: []
+requires_env: []
+config_schema:
+  endpoint:
+    type: str
+    default: "http://127.0.0.1:11434/v1/systemone"
+    label: Decision endpoint
+    description: "The only host ever called. A bearer key, if you set one, is sent only to this exact host."
+  model:
+    type: str
+    default: "pplx-decider:27b-nvfp4"
+    label: Decision model
+    description: "Model name sent to the endpoint."
+  timeout_s:
+    type: float
+    default: 18.0
+    label: Timeout (seconds)
+    description: "How long one decision may take before the task uses the default route."
+  api_key:
+    type: secret
+    env: DECIDER_API_KEY
+    label: Endpoint key
+    description: "Optional. Sent as a bearer token, and only to the host in endpoint. Leave empty for a local model."
