@@ -68,7 +68,11 @@ def test_put_decider_validates_and_persists(isolated_hermes):
         json={
             "enabled": True,
             "url": "http://192.168.1.50:11434",
-            "model": "pplx-decider:27b-nvfp4",
+            "primary_model": "pplx-decider:27b-nvfp4",
+            "allow_fallback": True,
+            "fallback_url": "https://decider.example.com",
+            "fallback_model": "jev-latest",
+            "fallback_api_key": "fb-live-secret-token",
             "specialist_threshold": 0.75,
             "confidence_threshold": 0.65,
             "timeout": 22.0,
@@ -77,9 +81,22 @@ def test_put_decider_validates_and_persists(isolated_hermes):
     assert ok.status_code == 200
     saved = ok.json()["decider"]
     assert saved["url"] == "http://192.168.1.50:11434/v1/systemone"
+    assert saved["fallback_url"] == "https://decider.example.com/v1/systemone"
+    assert saved["has_fallback_api_key"] is True
+    assert "fb-live-secret-token" not in ok.text
+    assert isolated_hermes["secrets"]["DECIDER_FALLBACK_API_KEY"] == "fb-live-secret-token"
     assert saved["specialist_threshold"] == 0.75
     assert saved["confidence_threshold"] == 0.65
     assert saved["timeout"] == 22.0
+
+    # Clearing fallback key removes it without leaking anything
+    cleared = client.put(
+        "/api/plugins/decider/decider",
+        json={"allow_fallback": False, "clear_fallback_api_key": True},
+    )
+    assert cleared.status_code == 200
+    assert cleared.json()["decider"]["has_fallback_api_key"] is False
+    assert "DECIDER_FALLBACK_API_KEY" not in isolated_hermes["secrets"]
 
 
 def test_put_decider_returns_409_when_config_is_managed(monkeypatch):

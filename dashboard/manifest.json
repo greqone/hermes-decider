@@ -3,7 +3,7 @@
   "label": "System-1 Decider",
   "description": "System-1 Decider (/v1/systemone) subagent auto-router settings, live probe, and routing history.",
   "icon": "GitBranch",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "tab": {
     "hidden": true
   },

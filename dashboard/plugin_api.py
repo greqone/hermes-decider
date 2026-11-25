@@ -50,7 +50,13 @@ def _build_state(decision_limit: int = 25) -> dict[str, Any]:
     cfg = store.full_config()
     section = store.delegation_section(cfg)
     mode = store.current_mode(section)
-    decider = store.decider_settings(cfg)
+    decider = dict(store.decider_settings(cfg))
+    try:
+        decider["has_api_key"] = bool(store.primary_api_key())
+        decider["has_fallback_api_key"] = bool(store.effective_fallback_api_key(decider["url"]))
+    except store.UnscopedSecretError:
+        decider["has_api_key"] = False
+        decider["has_fallback_api_key"] = False
     excluded = set(decider.get("excluded_options") or [])
     # Never expose raw credentials or base_urls over the transport: summary + eligibility only.
     routes = []
@@ -85,10 +91,12 @@ async def update_decider(payload: dict[str, Any] = Body(...)):
     def _run():
         cfg = store.full_config()
         current = dict(store.decider_settings(cfg))
+        if "model" in payload and "primary_model" not in payload:
+            current["primary_model"] = payload["model"]
         for key in (
             "enabled",
             "url",
-            "model",
+            "primary_model",
             "fallback_url",
             "fallback_model",
             "allow_fallback",
@@ -99,11 +107,56 @@ async def update_decider(payload: dict[str, Any] = Body(...)):
         ):
             if key in payload:
                 current[key] = payload[key]
-        problems = store.validate_decider(current)
+
+        raw_api_key = str(payload.get("api_key") or "").strip()
+        clear_api_key = payload.get("clear_api_key") is True
+        raw_fb_key = str(payload.get("fallback_api_key") or "").strip()
+        clear_fb_key = payload.get("clear_fallback_api_key") is True
+
+        secret_problems: list[str] = []
+        if raw_api_key:
+            err = store.validate_secret_input(raw_api_key, label=store.PRIMARY_KEY_ENV)
+            if err:
+                secret_problems.append(err)
+        if raw_fb_key:
+            err = store.validate_secret_input(raw_fb_key, label=store.FALLBACK_KEY_ENV)
+            if err:
+                secret_problems.append(err)
+
+        try:
+            cur_pri = bool(store.primary_api_key())
+            cur_fb = bool(store.fallback_api_key())
+        except store.UnscopedSecretError:
+            cur_pri = False
+            cur_fb = False
+
+        next_pri = True if raw_api_key else (False if clear_api_key else cur_pri)
+        eff_url = store.normalize_systemone_url(str(current.get("url") or store.DEFAULT_DECIDER_URL))
+        next_ded_fb = True if raw_fb_key else (False if clear_fb_key else cur_fb)
+        next_fb = next_ded_fb or (next_pri and store.is_ollama_endpoint(eff_url))
+
+        problems = secret_problems + store.validate_decider(
+            current,
+            has_primary_key=next_pri,
+            has_fallback_key=next_fb,
+        )
         if problems:
             raise HTTPException(status_code=400, detail=" ".join(problems))
+
         try:
+            if clear_api_key and not raw_api_key:
+                store.clear_secret(store.PRIMARY_KEY_ENV)
+            elif raw_api_key:
+                store.save_secret(store.PRIMARY_KEY_ENV, raw_api_key)
+
+            if clear_fb_key and not raw_fb_key:
+                store.clear_secret(store.FALLBACK_KEY_ENV)
+            elif raw_fb_key:
+                store.save_secret(store.FALLBACK_KEY_ENV, raw_fb_key)
+
             store.save_decider(current)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
         state = _build_state()

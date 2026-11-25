@@ -1,25 +1,40 @@
-"""Profile-scoped config readers and writers for the System-1 Decider plugin.
+"""Profile-scoped config and secret helpers for the System-1 Decider plugin.
 
 Reads use Hermes's public ``load_config_readonly``. Writes prefer ``update_user_config`` when
 present on ``hermes_cli.config`` and fall back to ``require_readable_config_before_write`` +
 ``atomic_config_write`` on older cores.
 
+Secrets (``DECIDER_API_KEY`` and ``DECIDER_FALLBACK_API_KEY``) are read exclusively through
+``agent.secret_scope.get_secret`` (propagating ``UnscopedSecretError``) and written/cleared
+exclusively through Hermes's public ``hermes_cli.config.save_env_value_secure`` /
+``remove_env_value``. Nothing in this plugin accesses ``os.environ`` or parses ``.env`` files.
+
 Routes are resolved from ``delegation.backends.decider.options`` when configured, falling back
 automatically to ``delegation.backends.model_map.options`` so routes managed in Hermes Desktop
 (**Settings ▸ Model ▸ Subagents**) or ``advanced-delegation`` work with zero duplication.
-
-Decider settings live in ``plugins.entries.decider.settings`` (flat keys matching ``plugin.yaml``'s
-``config_schema``). Nothing here reads environment variables or touches ``.env`` files.
 """
 
 from __future__ import annotations
 
 from collections import OrderedDict
+import math
 from typing import Any, Callable, Mapping
+from urllib.parse import urlsplit, urlunsplit
 
 from agent.delegation_provider import ROUTE_KEYS
+try:
+    from agent.secret_scope import UnscopedSecretError, get_secret
+except ImportError:  # pragma: no cover - older core fallback
+    from agent.secret_scope import get_secret  # type: ignore[misc]
+
+    class UnscopedSecretError(RuntimeError):  # type: ignore[no-redef]
+        pass
 
 PLUGIN_ID = "decider"
+
+PRIMARY_KEY_ENV = "DECIDER_API_KEY"
+FALLBACK_KEY_ENV = "DECIDER_FALLBACK_API_KEY"
+ALLOWED_SECRET_ENVS = frozenset({PRIMARY_KEY_ENV, FALLBACK_KEY_ENV})
 
 DEFAULT_DECIDER_URL = "http://127.0.0.1:11434/v1/systemone"
 DEFAULT_DECIDER_MODEL = "pplx-decider:27b-nvfp4"
@@ -47,10 +62,155 @@ MODES: dict[str, str] = {
 }
 
 _ROUTE_FIELDS = tuple(sorted(ROUTE_KEYS - {"label", "fallback_providers"}))
+_TRUE_STRINGS = frozenset({"1", "true", "yes", "on"})
+_FALSE_STRINGS = frozenset({"0", "false", "no", "off", ""})
 
 
 def _text(value: Any) -> str:
     return " ".join(value.split()) if isinstance(value, str) else ""
+
+
+def _parse_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        norm = value.strip().lower()
+        if norm in _TRUE_STRINGS:
+            return True
+        if norm in _FALSE_STRINGS:
+            return False
+    return default
+
+
+def is_loopback_host(hostname: str | None) -> bool:
+    return (hostname or "").strip().lower() in ("127.0.0.1", "localhost", "::1")
+
+
+def is_ollama_endpoint(url: str) -> bool:
+    """Return True for local/LAN Ollama-style endpoints that never take Bearer auth."""
+    raw = (url or "").strip()
+    if not raw:
+        return False
+    try:
+        parts = urlsplit(raw)
+        host = (parts.hostname or "").lower()
+        port = parts.port
+    except ValueError:
+        return False
+    if port == 11434 or (is_loopback_host(host) and port in (None, 11434)):
+        return True
+    if host.startswith("192.168.") or host.startswith("10."):
+        return port in (None, 11434)
+    if host.startswith("172."):
+        octets = host.split(".")
+        if len(octets) == 4 and octets[1].isdigit() and 16 <= int(octets[1]) <= 31:
+            return port in (None, 11434)
+    return False
+
+
+def display_url(raw_url: str) -> str:
+    """Strip any embedded userinfo from ``raw_url`` so logs and errors never echo credentials."""
+    text = (raw_url or "").strip()
+    if not text:
+        return ""
+    try:
+        parts = urlsplit(text)
+    except ValueError:
+        return "<invalid-url>"
+    if not parts.username and not parts.password:
+        return text
+    host = parts.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    try:
+        port = parts.port
+    except ValueError:
+        port = None
+    netloc = f"{host}:{port}" if port else host
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+
+
+def read_secret_value(env_name: str) -> str:
+    """Read an allowed plugin secret strictly via ``agent.secret_scope.get_secret``.
+
+    Propagates ``UnscopedSecretError`` untouched so unscoped calls fail closed.
+    """
+    if env_name not in ALLOWED_SECRET_ENVS:
+        raise ValueError(f"Unsupported Decider secret slot: {env_name!r}")
+    val = (get_secret(env_name, "") or "").strip()
+    if val and (not val.isascii() or not val.isprintable()):
+        return ""
+    return val
+
+
+def primary_api_key() -> str:
+    return read_secret_value(PRIMARY_KEY_ENV)
+
+
+def fallback_api_key() -> str:
+    return read_secret_value(FALLBACK_KEY_ENV)
+
+
+def effective_fallback_api_key(primary_url: str) -> str:
+    """Resolve the Bearer key for ``fallback_url``.
+
+    ``DECIDER_FALLBACK_API_KEY`` always takes precedence. For convenience when the primary endpoint
+    is local/keyless Ollama (``http://127.0.0.1:11434`` or LAN ``:11434``), ``DECIDER_API_KEY`` is
+    accepted as a fallback alias; when the primary endpoint is itself a non-Ollama remote server,
+    the two keys stay strictly isolated so credentials are never shared across distinct remote hosts.
+    """
+    dedicated = fallback_api_key()
+    if dedicated:
+        return dedicated
+    if is_ollama_endpoint(primary_url):
+        return primary_api_key()
+    return ""
+
+
+def validate_secret_input(raw_value: str, *, label: str = "API key") -> str | None:
+    """Validate a candidate secret string before persisting it."""
+    val = str(raw_value or "").strip()
+    if not val:
+        return f"{label} cannot be empty (use clear to remove a saved key)."
+    if set(val) == {"*"} or "«redacted" in val or val.endswith("..."):
+        return f"{label} looks like a redacted placeholder; paste the full key."
+    if not val.isascii() or not val.isprintable() or any(ch.isspace() for ch in val):
+        return f"{label} must contain printable ASCII characters with no spaces."
+    return None
+
+
+def save_secret(env_name: str, raw_value: str) -> None:
+    """Persist ``env_name`` via Hermes's unified credential lifecycle."""
+    if env_name not in ALLOWED_SECRET_ENVS:
+        raise ValueError(f"Unsupported Decider secret slot: {env_name!r}")
+    problem = validate_secret_input(raw_value, label=env_name)
+    if problem:
+        raise ValueError(problem)
+    cleaned = raw_value.strip()
+
+    from hermes_cli import config
+
+    if config.is_managed():
+        raise RuntimeError(config.format_managed_message(f"set {env_name}"))
+    secure_save = getattr(config, "save_env_value_secure", None)
+    if callable(secure_save):
+        secure_save(env_name, cleaned)
+    else:
+        config.save_env_value(env_name, cleaned)
+
+
+def clear_secret(env_name: str) -> bool:
+    """Remove ``env_name`` via Hermes's public ``remove_env_value`` helper."""
+    if env_name not in ALLOWED_SECRET_ENVS:
+        raise ValueError(f"Unsupported Decider secret slot: {env_name!r}")
+    from hermes_cli import config
+
+    if config.is_managed():
+        raise RuntimeError(config.format_managed_message(f"remove {env_name}"))
+    remover = getattr(config, "remove_env_value", None)
+    if callable(remover):
+        return bool(remover(env_name))
+    return False
 
 
 def full_config(config: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
@@ -132,6 +292,10 @@ def configured_options(section: Mapping[str, Any] | None = None) -> OrderedDict[
                 route[key] = val.strip()
             elif key == "request_overrides" and isinstance(val, Mapping):
                 route[key] = dict(val)
+        if entry.get("daybreak") is True:
+            overrides = dict(route.get("request_overrides") or {})
+            overrides["daybreak"] = True
+            route["request_overrides"] = overrides
         if isinstance(entry.get("fallback_providers"), list):
             route["fallback_providers"] = list(entry["fallback_providers"])
         out[name] = {
@@ -207,7 +371,9 @@ def _clamp_float(val: Any, default: float, low: float, high: float) -> float:
         return default
     try:
         num = float(val)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if not math.isfinite(num):
         return default
     return max(low, min(high, num))
 
@@ -219,15 +385,17 @@ def normalize_decider(raw: Mapping[str, Any] | None) -> dict[str, Any]:
     so task text never leaves the local machine unless explicitly configured by the operator.
     """
     src = raw if isinstance(raw, Mapping) else {}
-    enabled_raw = src.get("enabled")
-    enabled = enabled_raw if isinstance(enabled_raw, bool) else True
+    enabled = _parse_bool(src.get("enabled"), True)
 
     url_raw = _text(src.get("url")) or DEFAULT_DECIDER_URL
     url = normalize_systemone_url(url_raw)
-    model = _text(src.get("model")) or DEFAULT_DECIDER_MODEL
+    primary_model = (
+        _text(src.get("primary_model"))
+        or _text(src.get("model"))
+        or DEFAULT_DECIDER_MODEL
+    )
 
-    allow_fb_raw = src.get("allow_fallback")
-    allow_fallback = allow_fb_raw if isinstance(allow_fb_raw, bool) else False
+    allow_fallback = _parse_bool(src.get("allow_fallback"), False)
     fallback_url = _normalize_optional_url(src.get("fallback_url"))
     fallback_model = _text(src.get("fallback_model")) or DEFAULT_FALLBACK_MODEL
 
@@ -240,7 +408,7 @@ def normalize_decider(raw: Mapping[str, Any] | None) -> dict[str, Any]:
     return {
         "enabled": enabled,
         "url": url,
-        "model": model,
+        "primary_model": primary_model,
         "allow_fallback": allow_fallback,
         "fallback_url": fallback_url,
         "fallback_model": fallback_model,
@@ -264,21 +432,87 @@ def decider_enabled(config: Mapping[str, Any] | None = None) -> bool:
     return bool(decider_settings(config).get("enabled"))
 
 
-def validate_decider(settings: Mapping[str, Any]) -> list[str]:
+def validate_endpoint_url(
+    raw_url: str,
+    *,
+    label: str,
+    require_https_if_keyed: bool = False,
+) -> str | None:
+    """Validate a candidate ``/v1/systemone`` endpoint URL."""
+    text = (raw_url or "").strip()
+    if not text:
+        return None
+    try:
+        parts = urlsplit(text)
+        _ = parts.port
+    except ValueError:
+        return f"{label} has an invalid URL or port."
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        return f"{label} must start with http:// or https:// and include a hostname."
+    if parts.username or parts.password:
+        return (
+            f"{label} must not embed credentials in the URL; store API keys in plugin secrets "
+            f"({PRIMARY_KEY_ENV} / {FALLBACK_KEY_ENV})."
+        )
+    if require_https_if_keyed and parts.scheme == "http" and not is_loopback_host(parts.hostname):
+        return (
+            f"{label} must use https:// when an API key is configured "
+            f"(plain http:// is only permitted on localhost/loopback)."
+        )
+    return None
+
+
+def validate_decider(
+    settings: Mapping[str, Any],
+    *,
+    has_primary_key: bool | None = None,
+    has_fallback_key: bool | None = None,
+) -> list[str]:
     """Validate candidate System-1 Decider settings before saving (empty list = valid)."""
     problems: list[str] = []
     url = _text(settings.get("url"))
-    if url and not (url.startswith("http://") or url.startswith("https://")):
-        problems.append("Decider endpoint URL must start with http:// or https://.")
-    model = settings.get("model")
-    if model is not None and isinstance(model, str) and not model.strip() and "model" in settings:
-        # Blank string in UI resets to default ONLY when omitted; explicit whitespace-only when url set:
-        pass
     fb_url = _text(settings.get("fallback_url"))
-    if fb_url and not (fb_url.startswith("http://") or fb_url.startswith("https://")):
-        problems.append("Fallback URL must start with http:// or https:// (or be left blank).")
-    if settings.get("allow_fallback") is True and not fb_url:
+    allow_fb = _parse_bool(settings.get("allow_fallback"), False)
+
+    if has_primary_key is None:
+        try:
+            has_primary_key = bool(primary_api_key())
+        except UnscopedSecretError:
+            has_primary_key = False
+    if has_fallback_key is None:
+        try:
+            eff_url = normalize_systemone_url(url or DEFAULT_DECIDER_URL)
+            has_fallback_key = bool(effective_fallback_api_key(eff_url))
+        except UnscopedSecretError:
+            has_fallback_key = False
+
+    url_will_send_key = bool(has_primary_key and url and not is_ollama_endpoint(url))
+    url_err = validate_endpoint_url(
+        url,
+        label="Primary endpoint URL",
+        require_https_if_keyed=url_will_send_key,
+    )
+    if url_err:
+        problems.append(url_err)
+
+    fb_will_send_key = bool(has_fallback_key and fb_url and not is_ollama_endpoint(fb_url))
+    fb_err = validate_endpoint_url(
+        fb_url,
+        label="Fallback URL",
+        require_https_if_keyed=fb_will_send_key,
+    )
+    if fb_err:
+        problems.append(fb_err)
+
+    if allow_fb and not fb_url:
         problems.append("Fallback URL is required when secondary fallback is enabled.")
+    if (
+        allow_fb
+        and fb_url
+        and url
+        and normalize_systemone_url(fb_url) == normalize_systemone_url(url)
+    ):
+        problems.append("Fallback URL must differ from the primary endpoint URL.")
 
     for field, low, high in (
         ("specialist_threshold", 0.0, 1.0),
@@ -289,15 +523,15 @@ def validate_decider(settings: Mapping[str, Any]) -> list[str]:
         if val is None or val == "":
             continue
         if isinstance(val, bool):
-            problems.append(f"{field} must be a number between {low} and {high}.")
+            problems.append(f"{field} must be a finite number between {low} and {high}.")
             continue
         try:
             num = float(val)
-        except (TypeError, ValueError):
-            problems.append(f"{field} must be a number between {low} and {high}.")
+        except (TypeError, ValueError, OverflowError):
+            problems.append(f"{field} must be a finite number between {low} and {high}.")
             continue
-        if not (low <= num <= high):
-            problems.append(f"{field} must be between {low} and {high} (got {num}).")
+        if not math.isfinite(num) or not (low <= num <= high):
+            problems.append(f"{field} must be between {low} and {high} (got {val}).")
     return problems
 
 
@@ -331,7 +565,11 @@ def _write_config(mutate: Callable[[dict[str, Any]], None]) -> None:
 def save_decider(settings: Mapping[str, Any]) -> dict[str, Any]:
     """Validate/normalize and persist ``plugins.entries.decider.settings``."""
     cleaned_input = dict(settings)
-    for k in ("url", "model", "fallback_model"):
+    if "primary_model" not in cleaned_input and "model" in cleaned_input:
+        cleaned_input["primary_model"] = cleaned_input.pop("model")
+    else:
+        cleaned_input.pop("model", None)
+    for k in ("url", "primary_model", "fallback_model"):
         if cleaned_input.get(k) == "":
             cleaned_input.pop(k, None)
     normalized = normalize_decider(cleaned_input)
@@ -339,6 +577,7 @@ def save_decider(settings: Mapping[str, Any]) -> dict[str, Any]:
     def mutate(cfg: dict[str, Any]) -> None:
         own = _child(_child(_child(cfg, "plugins"), "entries"), PLUGIN_ID)
         target = _child(own, "settings")
+        target.pop("model", None)
         target.update(normalized)
 
     _write_config(mutate)

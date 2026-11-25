@@ -8,10 +8,11 @@ Evaluates unassigned ``delegate_task`` items in a single batched ``/v1/systemone
 
 Security & privacy invariants (matching catalog admission rules):
 - Zero ``os.environ`` reads and zero manual ``.env`` file reads.
-- Optional ``DECIDER_API_KEY`` is read exclusively via ``agent.secret_scope.get_secret``.
-- Bearer credentials are attached only when calling a non-local host that matches the exact host
-  configured by the operator, and requests run through ``open_credentialed_url`` so redirects
-  never forward credentials across origins.
+- Optional ``DECIDER_API_KEY`` and ``DECIDER_FALLBACK_API_KEY`` are read exclusively via
+  ``agent.secret_scope.get_secret`` (propagating ``UnscopedSecretError``).
+- Bearer credentials are strictly host-locked to their configured endpoint, never sent to local/LAN
+  Ollama endpoints, never sent over cleartext ``http://`` off localhost/loopback, and stripped on
+  cross-origin redirects via ``open_credentialed_url``.
 - Secondary fallback is disabled by default (``allow_fallback: False``, ``fallback_url: ""``), so
   task text never leaves the machine unless explicitly opted into by the operator.
 - Never attaches undeclared properties (such as ``_decider_evaluated``) to ``delegate_task`` items,
@@ -25,21 +26,28 @@ import hashlib
 import importlib.util
 import json
 import logging
+import math
+import os
 from pathlib import Path
+import threading
 import time
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 import urllib.error
 import urllib.request
 
-from agent.secret_scope import get_secret
-
 logger = logging.getLogger(__name__)
 
-API_KEY_ENV = "DECIDER_API_KEY"
 _MAX_LOG_ENTRIES = 100
-_LAN_COOLDOWN_UNTIL: float = 0.0
-_LAN_COOLDOWN_SECONDS: float = 45.0
+_MAX_RESPONSE_BYTES = 2 * 1024 * 1024  # 2 MiB safety ceiling on /v1/systemone responses
+_PRIMARY_COOLDOWN_SECONDS: float = 45.0
+
+_STATE_LOCK = threading.RLock()
+_LOG_LOCK = threading.RLock()
+
+# Cooldown keyed by (primary_url, primary_model) so editing the URL/model immediately clears any
+# prior cooldown instead of routing to fallback for 45s on stale state.
+_PRIMARY_COOLDOWN_UNTIL: dict[tuple[str, str], float] = {}
 
 # Short-lived in-memory cache so a batch decision evaluated in `pre_tool_call` that intentionally
 # leaves `option` unset (when `default` is empty -> inherit parent route) is not re-queried a
@@ -64,9 +72,9 @@ def _load_store():
 
 def reset_runtime_caches() -> None:
     """Clear in-memory cooldown and recent-decision caches (used by tests)."""
-    global _LAN_COOLDOWN_UNTIL
-    _LAN_COOLDOWN_UNTIL = 0.0
-    _RECENT_DECISIONS.clear()
+    with _STATE_LOCK:
+        _PRIMARY_COOLDOWN_UNTIL.clear()
+        _RECENT_DECISIONS.clear()
 
 
 def _head_tail(text: str, head: int = 320, tail: int = 160) -> str:
@@ -78,36 +86,23 @@ def _head_tail(text: str, head: int = 320, tail: int = 160) -> str:
     return f"{cleaned[:head]} ...[+{omitted} chars]... {cleaned[-tail:]}"
 
 
-def _host(url: str) -> str:
+def _host_and_scheme(url: str) -> tuple[str, str]:
     try:
-        return (urlsplit(url).hostname or "").lower()
+        parts = urlsplit(url)
+        return (parts.hostname or "").lower(), (parts.scheme or "").lower()
     except ValueError:
-        return ""
+        return "", ""
 
 
-def _is_ollama_endpoint(url: str) -> bool:
-    lower = (url or "").lower()
-    host = _host(url)
-    return (
-        ":11434" in lower
-        or host in ("127.0.0.1", "localhost", "::1")
-        or host.startswith("192.168.")
-        or host.startswith("10.")
-        or (host.startswith("172.") and len(host.split(".")) == 4 and host.split(".")[1].isdigit()
-            and 16 <= int(host.split(".")[1]) <= 31)
-    )
-
-
-def _adapt_questions_for_endpoint(questions: Mapping[str, Any], url: str) -> dict[str, Any]:
+def _adapt_questions_for_endpoint(questions: Mapping[str, Any], url: str, *, is_ollama: bool) -> dict[str, Any]:
     """Ollama expects ``criteria`` on all question types; remote ``/v1/systemone`` expects ``criterion`` on ``noul``."""
-    use_ollama = _is_ollama_endpoint(url)
     adapted: dict[str, Any] = {}
     for qname, qspec in questions.items():
         if not isinstance(qspec, Mapping):
             continue
         q = dict(qspec)
         qtype = q.get("type")
-        if use_ollama:
+        if is_ollama:
             if "criterion" in q and "criteria" not in q:
                 q["criteria"] = q.pop("criterion")
         elif qtype == "noul":
@@ -117,34 +112,45 @@ def _adapt_questions_for_endpoint(questions: Mapping[str, Any], url: str) -> dic
     return adapted
 
 
-def _decider_api_key() -> str:
-    """Read optional ``DECIDER_API_KEY`` strictly via Hermes's profile-scoped ``get_secret``."""
-    try:
-        return (get_secret(API_KEY_ENV, "") or "").strip()
-    except Exception:
-        return ""
-
-
 def attach_bearer_if_allowed(
     request: urllib.request.Request,
     *,
     configured_url: str,
     api_key: str,
+    key_label: str = "DECIDER_API_KEY",
 ) -> None:
-    """Attach ``Authorization: Bearer`` only for non-local requests matching ``configured_url``'s exact host."""
-    if not api_key or _is_ollama_endpoint(configured_url):
+    """Attach ``Authorization: Bearer`` strictly when safe and host-matched.
+
+    Refuses:
+    - empty or non-ASCII/non-printable keys
+    - local/LAN Ollama endpoints
+    - mismatched request vs configured hostnames
+    - cleartext ``http://`` on any non-loopback host
+    """
+    store = _load_store()
+    cleaned = (api_key or "").strip()
+    if not cleaned or not cleaned.isascii() or not cleaned.isprintable():
         return
-    req_host = _host(request.full_url)
-    cfg_host = _host(configured_url)
+    if store.is_ollama_endpoint(configured_url):
+        return
+    req_host, req_scheme = _host_and_scheme(request.full_url)
+    cfg_host, _ = _host_and_scheme(configured_url)
     if not req_host or req_host != cfg_host:
         logger.warning(
             "decider: refusing to send %s to host %r (configured host is %r)",
-            API_KEY_ENV,
+            key_label,
             req_host,
             cfg_host,
         )
         return
-    request.add_header("Authorization", f"Bearer {api_key}")
+    if req_scheme != "https" and not store.is_loopback_host(req_host):
+        logger.warning(
+            "decider: refusing to send %s over cleartext http:// to non-loopback host %r",
+            key_label,
+            req_host,
+        )
+        return
+    request.add_header("Authorization", f"Bearer {cleaned}")
 
 
 def _user_agent() -> str:
@@ -152,7 +158,7 @@ def _user_agent() -> str:
         from hermes_cli.version_info import hermes_user_agent
         return hermes_user_agent("hermes-decider")
     except Exception:
-        return "hermes-decider/1.1"
+        return "hermes-decider/1.2"
 
 
 def _open_url(request: urllib.request.Request, timeout: float):
@@ -203,7 +209,7 @@ def _extract_noul_prob(entry: Mapping[str, Any] | None) -> float:
         return 0.0
     for key in ("noul", "yes_probability", "probability"):
         val = entry.get(key)
-        if isinstance(val, (int, float)) and not isinstance(val, bool):
+        if isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(float(val)):
             return float(val)
     return 0.0
 
@@ -216,15 +222,17 @@ def _post_systemone_once(
     questions: Mapping[str, Any],
     timeout: float,
     api_key: str = "",
+    key_label: str = "DECIDER_API_KEY",
 ) -> dict[str, Any]:
-    use_ollama = _is_ollama_endpoint(url)
+    store = _load_store()
+    use_ollama = store.is_ollama_endpoint(url)
     serialized_state: Any = (
         state if use_ollama else json.dumps(state, ensure_ascii=False, separators=(",", ":"))
     )
     body: dict[str, Any] = {
         "model": model,
         "state": serialized_state,
-        "questions": _adapt_questions_for_endpoint(questions, url),
+        "questions": _adapt_questions_for_endpoint(questions, url, is_ollama=use_ollama),
     }
     if use_ollama:
         body["keep_alive"] = -1
@@ -239,40 +247,93 @@ def _post_systemone_once(
         },
         method="POST",
     )
-    attach_bearer_if_allowed(req, configured_url=url, api_key=api_key)
+    attach_bearer_if_allowed(req, configured_url=url, api_key=api_key, key_label=key_label)
 
-    with _open_url(req, timeout=timeout) as resp:
-        raw = resp.read().decode("utf-8")
-    parsed = json.loads(raw)
+    try:
+        with _open_url(req, timeout=timeout) as resp:
+            chunk = resp.read(_MAX_RESPONSE_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        safe = store.display_url(url)
+        raise RuntimeError(f"HTTP {exc.code} from {safe}") from None
+    except urllib.error.URLError as exc:
+        safe = store.display_url(url)
+        raise RuntimeError(f"Connection to {safe} failed: {exc.reason}") from None
+
+    if len(chunk) > _MAX_RESPONSE_BYTES:
+        raise RuntimeError(f"Response from {store.display_url(url)} exceeded {_MAX_RESPONSE_BYTES} bytes")
+    parsed = json.loads(chunk.decode("utf-8"))
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _is_primary_in_cooldown(key: tuple[str, str]) -> bool:
+    with _STATE_LOCK:
+        until = _PRIMARY_COOLDOWN_UNTIL.get(key, 0.0)
+        if until <= 0.0:
+            return False
+        if time.monotonic() >= until:
+            _PRIMARY_COOLDOWN_UNTIL.pop(key, None)
+            return False
+        return True
+
+
+def _mark_primary_cooldown(key: tuple[str, str]) -> None:
+    with _STATE_LOCK:
+        _PRIMARY_COOLDOWN_UNTIL[key] = time.monotonic() + _PRIMARY_COOLDOWN_SECONDS
+
+
+def _clear_primary_cooldown(key: tuple[str, str]) -> None:
+    with _STATE_LOCK:
+        _PRIMARY_COOLDOWN_UNTIL.pop(key, None)
 
 
 def call_systemone(
     state: dict[str, Any],
     questions: Mapping[str, Any],
     dec_cfg: Mapping[str, Any],
+    *,
+    bypass_cooldown: bool = False,
 ) -> dict[str, Any]:
     """Call primary ``/v1/systemone`` endpoint; use secondary fallback ONLY when explicitly enabled."""
-    global _LAN_COOLDOWN_UNTIL
+    store = _load_store()
     primary_url = str(dec_cfg["url"])
+    primary_model = str(dec_cfg.get("primary_model") or dec_cfg.get("model") or store.DEFAULT_DECIDER_MODEL)
     fb_url = str(dec_cfg.get("fallback_url") or "")
-    api_key = _decider_api_key()
+    fb_model = str(dec_cfg.get("fallback_model") or store.DEFAULT_FALLBACK_MODEL)
+    timeout = float(dec_cfg["timeout"])
+
+    # Note: UnscopedSecretError propagates untouched if secret_scope is unbound.
+    primary_key = store.primary_api_key()
+    fb_key = store.effective_fallback_api_key(primary_url) if fb_url else ""
+
+    fb_host, fb_scheme = _host_and_scheme(fb_url)
+    fb_transport_ok = bool(
+        fb_url
+        and (
+            store.is_ollama_endpoint(fb_url)
+            or (
+                bool(fb_key)
+                and (fb_scheme == "https" or store.is_loopback_host(fb_host))
+            )
+        )
+    )
     can_fallback = (
         bool(dec_cfg.get("allow_fallback"))
         and bool(fb_url)
         and fb_url != primary_url
-        and (_is_ollama_endpoint(fb_url) or bool(api_key))
+        and fb_transport_ok
     )
 
+    cooldown_key = (primary_url, primary_model)
     t0 = time.perf_counter()
-    if can_fallback and _is_ollama_endpoint(primary_url) and time.monotonic() < _LAN_COOLDOWN_UNTIL:
+    if can_fallback and not bypass_cooldown and _is_primary_in_cooldown(cooldown_key):
         data = _post_systemone_once(
             url=fb_url,
-            model=str(dec_cfg["fallback_model"]),
+            model=fb_model,
             state=state,
             questions=questions,
-            timeout=float(dec_cfg["timeout"]),
-            api_key=api_key,
+            timeout=timeout,
+            api_key=fb_key,
+            key_label=store.FALLBACK_KEY_ENV,
         )
         data["fallback_used"] = True
         data["latency_ms"] = round((time.perf_counter() - t0) * 1000.0, 1)
@@ -281,34 +342,47 @@ def call_systemone(
     try:
         data = _post_systemone_once(
             url=primary_url,
-            model=str(dec_cfg["model"]),
+            model=primary_model,
             state=state,
             questions=questions,
-            timeout=float(dec_cfg["timeout"]),
-            api_key=api_key,
+            timeout=timeout,
+            api_key=primary_key,
+            key_label=store.PRIMARY_KEY_ENV,
         )
+        _clear_primary_cooldown(cooldown_key)
         data["fallback_used"] = False
         data["latency_ms"] = round((time.perf_counter() - t0) * 1000.0, 1)
         return data
     except Exception as primary_err:
-        if _is_ollama_endpoint(primary_url):
-            _LAN_COOLDOWN_UNTIL = time.monotonic() + _LAN_COOLDOWN_SECONDS
+        _mark_primary_cooldown(cooldown_key)
         if not can_fallback:
+            if (
+                bool(dec_cfg.get("allow_fallback"))
+                and bool(fb_url)
+                and not store.is_ollama_endpoint(fb_url)
+                and not fb_key
+            ):
+                logger.warning(
+                    "decider: secondary fallback %s is enabled without %s; skipping unauthenticated fallback",
+                    store.display_url(fb_url),
+                    store.FALLBACK_KEY_ENV,
+                )
             raise
         logger.warning(
             "decider: primary endpoint %s failed (%s); using opted-in fallback %s",
-            primary_url,
+            store.display_url(primary_url),
             primary_err,
-            fb_url,
+            store.display_url(fb_url),
         )
         t_fb = time.perf_counter()
         data = _post_systemone_once(
             url=fb_url,
-            model=str(dec_cfg["fallback_model"]),
+            model=fb_model,
             state=state,
             questions=questions,
-            timeout=float(dec_cfg["timeout"]),
-            api_key=api_key,
+            timeout=timeout,
+            api_key=fb_key,
+            key_label=store.FALLBACK_KEY_ENV,
         )
         data["fallback_used"] = True
         data["latency_ms"] = round((time.perf_counter() - t_fb) * 1000.0, 1)
@@ -324,59 +398,84 @@ def _decision_log_path() -> Path | None:
 
 
 def _record_decision(entry: dict[str, Any]) -> None:
+    """Append ``entry`` to the bounded JSONL log using a PID+TID temp file and atomic replace."""
     path = _decision_log_path()
     if path is None:
         return
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        existing: list[str] = []
-        if path.is_file():
-            existing = [
-                ln for ln in path.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip()
-            ]
-        existing.append(json.dumps(entry, ensure_ascii=False))
-        if len(existing) > _MAX_LOG_ENTRIES:
-            existing = existing[-_MAX_LOG_ENTRIES:]
-        path.write_text("\n".join(existing) + "\n", encoding="utf-8")
-    except Exception:
-        pass
+    line = json.dumps(entry, ensure_ascii=False)
+    with _LOG_LOCK:
+        tmp: Path | None = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            existing: list[str] = []
+            if path.is_file():
+                existing = [
+                    ln for ln in path.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip()
+                ]
+            existing.append(line)
+            if len(existing) > _MAX_LOG_ENTRIES:
+                existing = existing[-_MAX_LOG_ENTRIES:]
+            tmp = path.parent / f".decisions.{os.getpid()}.{threading.get_ident()}.tmp"
+            tmp.write_text("\n".join(existing) + "\n", encoding="utf-8")
+            for attempt in range(3):
+                try:
+                    os.replace(tmp, path)
+                    break
+                except PermissionError:
+                    if attempt == 2:
+                        break
+                    time.sleep(0.01 * (attempt + 1))
+        except Exception:
+            pass
+        finally:
+            if tmp is not None:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
 
 def read_decision_log(limit: int = 30) -> list[dict[str, Any]]:
     """Return the most recent Decider routing decisions (newest first)."""
     path = _decision_log_path()
-    if path is None or not path.is_file():
+    if path is None:
         return []
-    try:
-        lines = [
-            ln for ln in path.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip()
-        ]
-        items: list[dict[str, Any]] = []
-        for ln in reversed(lines[-max(1, min(int(limit), _MAX_LOG_ENTRIES)):]):
-            try:
-                row = json.loads(ln)
-                if isinstance(row, dict):
-                    items.append(row)
-            except Exception:
-                continue
-        return items
-    except Exception:
-        return []
+    with _LOG_LOCK:
+        if not path.is_file():
+            return []
+        try:
+            lines = [
+                ln for ln in path.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip()
+            ]
+            items: list[dict[str, Any]] = []
+            for ln in reversed(lines[-max(1, min(int(limit), _MAX_LOG_ENTRIES)):]):
+                try:
+                    row = json.loads(ln)
+                    if isinstance(row, dict):
+                        items.append(row)
+                except Exception:
+                    continue
+            return items
+        except Exception:
+            return []
 
 
 def clear_decision_log() -> int:
     """Clear the cached Decider routing log and return the number of removed entries."""
     path = _decision_log_path()
-    if path is None or not path.is_file():
+    if path is None:
         return 0
-    try:
-        lines = [
-            ln for ln in path.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip()
-        ]
-        path.unlink(missing_ok=True)
-        return len(lines)
-    except Exception:
-        return 0
+    with _LOG_LOCK:
+        if not path.is_file():
+            return 0
+        try:
+            lines = [
+                ln for ln in path.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip()
+            ]
+            path.unlink(missing_ok=True)
+            return len(lines)
+        except Exception:
+            return 0
 
 
 def _cache_key(eligible: Mapping[str, str], default_opt: str, goal: str, context: str) -> str:
@@ -389,31 +488,34 @@ def _cache_key(eligible: Mapping[str, str], default_opt: str, goal: str, context
 
 
 def _remember_decision(key: str, chosen_or_empty: str) -> None:
-    now = time.monotonic()
-    expired = [k for k, (exp, _) in _RECENT_DECISIONS.items() if exp <= now]
-    for k in expired:
-        _RECENT_DECISIONS.pop(k, None)
-    _RECENT_DECISIONS[key] = (now + _RECENT_TTL_SECONDS, chosen_or_empty)
-    _RECENT_DECISIONS.move_to_end(key)
-    while len(_RECENT_DECISIONS) > _RECENT_MAX_ENTRIES:
-        _RECENT_DECISIONS.popitem(last=False)
+    with _STATE_LOCK:
+        now = time.monotonic()
+        expired = [k for k, (exp, _) in _RECENT_DECISIONS.items() if exp <= now]
+        for k in expired:
+            _RECENT_DECISIONS.pop(k, None)
+        _RECENT_DECISIONS[key] = (now + _RECENT_TTL_SECONDS, chosen_or_empty)
+        _RECENT_DECISIONS.move_to_end(key)
+        while len(_RECENT_DECISIONS) > _RECENT_MAX_ENTRIES:
+            _RECENT_DECISIONS.popitem(last=False)
 
 
 def _lookup_recent_decision(key: str) -> tuple[bool, str]:
-    hit = _RECENT_DECISIONS.get(key)
-    if hit is None:
-        return False, ""
-    exp, val = hit
-    if exp <= time.monotonic():
-        _RECENT_DECISIONS.pop(key, None)
-        return False, ""
-    return True, val
+    with _STATE_LOCK:
+        hit = _RECENT_DECISIONS.get(key)
+        if hit is None:
+            return False, ""
+        exp, val = hit
+        if exp <= time.monotonic():
+            _RECENT_DECISIONS.pop(key, None)
+            return False, ""
+        return True, val
 
 
 def route_unassigned_tasks(
     tasks: list[dict[str, Any]],
     *,
     config: Mapping[str, Any] | None = None,
+    section: Mapping[str, Any] | None = None,
 ) -> dict[int, str]:
     """Batch-route unassigned ``delegate_task`` items in place (setting ONLY ``task['option']``).
 
@@ -421,18 +523,6 @@ def route_unassigned_tasks(
     validator accepts every task cleanly.
     """
     store = _load_store()
-    dec_cfg = store.decider_settings(config)
-    if not dec_cfg.get("enabled"):
-        return {}
-
-    section = store.delegation_section(config)
-    options = store.configured_options(section)
-    eligible = eligible_routes(options, dec_cfg)
-    if not eligible:
-        return {}
-
-    default_opt = store.route_default(section)
-
     unassigned: list[tuple[int, dict[str, Any]]] = []
     for idx, task in enumerate(tasks):
         if not isinstance(task, dict):
@@ -447,6 +537,19 @@ def route_unassigned_tasks(
 
     if not unassigned:
         return {}
+
+    dec_cfg = store.decider_settings(config)
+    if not dec_cfg.get("enabled"):
+        return {}
+
+    eff_section = store.delegation_section(section if section is not None else config)
+    options = store.configured_options(eff_section)
+    eligible = eligible_routes(options, dec_cfg)
+    if not eligible:
+        return {}
+
+    default_opt = store.route_default(eff_section)
+    primary_model = str(dec_cfg.get("primary_model") or dec_cfg.get("model") or store.DEFAULT_DECIDER_MODEL)
 
     # TTFT optimization on non-causal decision models (e.g. pplx-decider:27b-nvfp4 on Apple Silicon
     # MLX): keep full route descriptions once in `state.available_routes` when batching >1 tasks.
@@ -504,6 +607,8 @@ def route_unassigned_tasks(
 
     try:
         resp = call_systemone(state, questions, dec_cfg)
+    except store.UnscopedSecretError:
+        raise
     except Exception as exc:
         logger.warning(
             "decider: endpoint unreachable (%s); keeping default route %r",
@@ -524,7 +629,7 @@ def route_unassigned_tasks(
     spec_thresh = float(dec_cfg["specialist_threshold"])
     conf_thresh = float(dec_cfg["confidence_threshold"])
     latency_ms = resp.get("latency_ms", 0.0)
-    used_model = str(resp.get("model") or dec_cfg["model"])
+    used_model = str(resp.get("model") or primary_model)
     fallback_used = bool(resp.get("fallback_used", False))
 
     assigned: dict[int, str] = {}
@@ -535,7 +640,12 @@ def route_unassigned_tasks(
 
         needs_p = _extract_noul_prob(needs_d if isinstance(needs_d, Mapping) else None)
         picked = str((route_d if isinstance(route_d, Mapping) else {}).get("choice") or "").strip()
-        conf = float((route_d if isinstance(route_d, Mapping) else {}).get("confidence", 0.0) or 0.0)
+        raw_conf = (route_d if isinstance(route_d, Mapping) else {}).get("confidence", 0.0)
+        conf = (
+            float(raw_conf)
+            if isinstance(raw_conf, (int, float)) and not isinstance(raw_conf, bool) and math.isfinite(float(raw_conf))
+            else 0.0
+        )
         has_images = bool(state_tasks[key]["has_images"])
 
         if (
@@ -604,22 +714,23 @@ def route_single_task(
     task: Mapping[str, Any],
     *,
     config: Mapping[str, Any] | None = None,
+    section: Mapping[str, Any] | None = None,
 ) -> str:
     """Resolve one unassigned task inside ``DeciderDelegationProvider.route_task`` (cache-aware)."""
     store = _load_store()
+    goal = str(task.get("goal") or "").strip()
+    if not goal:
+        return ""
     dec_cfg = store.decider_settings(config)
     if not dec_cfg.get("enabled"):
         return ""
-    section = store.delegation_section(config)
-    options = store.configured_options(section)
+    eff_section = store.delegation_section(section if section is not None else config)
+    options = store.configured_options(eff_section)
     eligible = eligible_routes(options, dec_cfg)
     if not eligible:
         return ""
-    default_opt = store.route_default(section)
-    goal = str(task.get("goal") or "").strip()
+    default_opt = store.route_default(eff_section)
     context = str(task.get("context") or "")
-    if not goal:
-        return ""
 
     ckey = _cache_key(eligible, default_opt, goal, context)
     hit, cached_choice = _lookup_recent_decision(ckey)
@@ -627,7 +738,7 @@ def route_single_task(
         return cached_choice
 
     probe = dict(task)
-    route_unassigned_tasks([probe], config=config)
+    route_unassigned_tasks([probe], config=config, section=eff_section)
     opt = probe.get("option")
     return opt.strip() if isinstance(opt, str) and opt.strip() else ""
 
@@ -646,6 +757,7 @@ def probe_decider(
     options = store.configured_options(section)
     eligible = eligible_routes(options, dec_cfg)
     default_opt = store.route_default(section)
+    primary_model = str(dec_cfg.get("primary_model") or dec_cfg.get("model") or store.DEFAULT_DECIDER_MODEL)
 
     if not eligible:
         return {
@@ -694,7 +806,9 @@ def probe_decider(
     }
 
     try:
-        resp = call_systemone(state, questions, dec_cfg)
+        resp = call_systemone(state, questions, dec_cfg, bypass_cooldown=True)
+    except store.UnscopedSecretError:
+        raise
     except Exception as exc:
         return {
             "ok": False,
@@ -707,7 +821,12 @@ def probe_decider(
     route_d = decisions.get("t0_route") if isinstance(decisions, Mapping) else {}
     needs_p = _extract_noul_prob(needs_d if isinstance(needs_d, Mapping) else None)
     picked = str((route_d or {}).get("choice") or "").strip()
-    conf = float((route_d or {}).get("confidence", 0.0) or 0.0)
+    raw_conf = (route_d or {}).get("confidence", 0.0) if isinstance(route_d, Mapping) else 0.0
+    conf = (
+        float(raw_conf)
+        if isinstance(raw_conf, (int, float)) and not isinstance(raw_conf, bool) and math.isfinite(float(raw_conf))
+        else 0.0
+    )
     scores = (
         (route_d or {}).get("probabilities") or (route_d or {}).get("scores")
         if isinstance(route_d, Mapping)
@@ -736,7 +855,7 @@ def probe_decider(
         "confidence": round(conf, 4),
         "scores": scores if isinstance(scores, Mapping) else {},
         "latency_ms": resp.get("latency_ms", 0.0),
-        "model": resp.get("model", dec_cfg["model"]),
+        "model": resp.get("model", primary_model),
         "fallback_used": bool(resp.get("fallback_used", False)),
         "config": dec_cfg,
     }

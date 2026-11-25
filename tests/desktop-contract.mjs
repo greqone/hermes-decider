@@ -156,10 +156,12 @@ const sampleState = {
   decider: {
     enabled: true,
     url: 'http://127.0.0.1:11434/v1/systemone',
-    model: 'pplx-decider:27b-nvfp4',
+    primary_model: 'pplx-decider:27b-nvfp4',
+    has_api_key: false,
     allow_fallback: false,
     fallback_url: '',
     fallback_model: 'jev-latest',
+    has_fallback_api_key: false,
     specialist_threshold: 0.7,
     confidence_threshold: 0.6,
     timeout: 18,
@@ -284,12 +286,17 @@ const scenarios = {
       const m = /^(\d+(?:\.\d+)?)rem$/.exec(String(input.props.style?.width || ''))
       return m ? Number(m[1]) : 0
     }
-    for (const label of ['Endpoint', 'Fallback endpoint']) {
-      assert.ok(rem(label) >= 16, `${label} width ${rem(label)}rem cannot show a URL`)
+    for (const label of ['Endpoint', 'Fallback endpoint', 'Fallback API key']) {
+      assert.ok(rem(label) >= 16, `${label} width ${rem(label)}rem cannot show a URL/key`)
     }
     for (const label of ['Specialist threshold', 'Route confidence', 'Timeout']) {
       assert.ok(rem(label) > 0 && rem(label) <= 6, `${label} width ${rem(label)}rem is not sized for a short number`)
     }
+    // Verify write-only payload omission when blank and inclusion when typed
+    const blankPayload = mod.toPayload(mod.toForm(withFallback.decider))
+    assert.equal('fallback_api_key' in blankPayload, false)
+    const keyedPayload = mod.toPayload({ ...mod.toForm(withFallback.decider), fallback_api_key: '  sk-fb-test  ' })
+    assert.equal(keyedPayload.fallback_api_key, 'sk-fb-test')
     h.disposers.forEach(fn => fn())
   }
 }

@@ -70,7 +70,7 @@ def handle(raw_args: str = "", *, session_key: str = "", api=None) -> str:
             saved = store.save_decider(dec)
         except RuntimeError as exc:
             return f"Could not enable System-1 Decider: {exc}"
-        return f"System-1 Decider auto-router: ON ({saved['model']} @ {saved['url']})."
+        return f"System-1 Decider auto-router: ON ({saved['primary_model']} @ {store.display_url(saved['url'])})."
 
     if sub in ("off", "disable", "disabled"):
         dec["enabled"] = False
@@ -121,14 +121,22 @@ def handle(raw_args: str = "", *, session_key: str = "", api=None) -> str:
 
     mode = store.current_mode(cfg)
     state_lbl = "ON" if dec["enabled"] else "OFF"
-    fb_lbl = (
-        f"{dec['fallback_model']} @ {dec['fallback_url']}"
-        if dec["allow_fallback"] and dec["fallback_url"]
-        else "off (local-only)"
-    )
+    if dec["allow_fallback"] and dec["fallback_url"]:
+        try:
+            has_fb_key = bool(store.effective_fallback_api_key(dec["url"]))
+        except store.UnscopedSecretError:
+            has_fb_key = False
+        fb_tag = (
+            ""
+            if store.is_ollama_endpoint(dec["fallback_url"])
+            else (" [key: set]" if has_fb_key else " [key: NOT SET]")
+        )
+        fb_lbl = f"{dec['fallback_model']} @ {store.display_url(dec['fallback_url'])}{fb_tag}"
+    else:
+        fb_lbl = "off (local-only)"
     return (
         f"System-1 Decider auto-router: {state_lbl} (delegation.backend: {mode})\n"
-        f"  Primary: {dec['model']} @ {dec['url']}\n"
+        f"  Primary: {dec['primary_model']} @ {store.display_url(dec['url'])}\n"
         f"  Fallback: {fb_lbl}\n"
         f"  Thresholds: specialist >= {dec['specialist_threshold']:.2f}, confidence >= {dec['confidence_threshold']:.2f}, timeout {dec['timeout']:.0f}s\n"
         f"  Excluded routes: {', '.join(dec['excluded_options']) if dec['excluded_options'] else '(none)'}\n"

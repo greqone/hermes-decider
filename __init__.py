@@ -17,6 +17,18 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+def _has_unassigned_task(tasks: list[Any]) -> bool:
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        opt = task.get("option")
+        if isinstance(opt, str) and opt.strip():
+            continue
+        if str(task.get("goal") or "").strip():
+            return True
+    return False
+
+
 def _on_pre_tool_call(tool_name: str = "", args: dict[str, Any] | None = None, **_: Any):
     """Batch-route unassigned ``delegate_task`` items via ``/v1/systemone`` before spawn."""
     if tool_name != "delegate_task" or not isinstance(args, dict):
@@ -25,11 +37,15 @@ def _on_pre_tool_call(tool_name: str = "", args: dict[str, Any] | None = None, *
     if action != "spawn":
         return None
     tasks = args.get("tasks")
-    if not isinstance(tasks, list) or not tasks:
+    if not isinstance(tasks, list) or not _has_unassigned_task(tasks):
         return None
     try:
         from . import decider_router, store
+    except Exception as exc:
+        logger.debug("decider pre_tool_call import skipped: %s", exc)
+        return None
 
+    try:
         cfg = store.full_config()
         section = store.delegation_section(cfg)
         mode = store.current_mode(section)
@@ -38,9 +54,11 @@ def _on_pre_tool_call(tool_name: str = "", args: dict[str, Any] | None = None, *
         if not store.decider_enabled(cfg):
             return None
         cloned_tasks = [dict(t) if isinstance(t, dict) else t for t in tasks]
-        assigned = decider_router.route_unassigned_tasks(cloned_tasks, config=cfg)
+        assigned = decider_router.route_unassigned_tasks(cloned_tasks, config=cfg, section=section)
         if assigned:
             return {"action": "modify", "args": {"tasks": cloned_tasks}}
+    except store.UnscopedSecretError:
+        raise
     except Exception as exc:
         logger.debug("decider pre_tool_call hook skipped: %s", exc)
     return None

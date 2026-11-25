@@ -53,6 +53,11 @@ def _ensure_hermes_stubs() -> None:
     except ImportError:
         agent_mod = sys.modules.setdefault("agent", types.ModuleType("agent"))
         ss = types.ModuleType("agent.secret_scope")
+
+        class UnscopedSecretError(RuntimeError):
+            pass
+
+        ss.UnscopedSecretError = UnscopedSecretError
         ss.get_secret = lambda name, default=None: default
         agent_mod.secret_scope = ss
         sys.modules["agent.secret_scope"] = ss
@@ -164,9 +169,11 @@ def sample_routes() -> list[dict[str, Any]]:
 @pytest.fixture(autouse=True)
 def isolated_hermes(monkeypatch, tmp_path):
     """Give every test an isolated in-memory config, cache home, and empty secret store."""
+    import agent.secret_scope as ss_mod
     import hermes_constants
     from hermes_cli import config as hermes_cfg
     import decider_plugin.decider_router as router_mod
+    import decider_plugin.store as store_mod
 
     home = tmp_path / "hermes_home"
     home.mkdir(parents=True, exist_ok=True)
@@ -187,13 +194,16 @@ def isolated_hermes(monkeypatch, tmp_path):
                     "settings": {
                         "enabled": True,
                         "url": "http://127.0.0.1:11434/v1/systemone",
-                        "model": "pplx-decider:27b-nvfp4",
+                        "primary_model": "pplx-decider:27b-nvfp4",
                     },
                 }
             }
         },
     }
     secrets: dict[str, str] = {}
+
+    def _fake_get_secret(name: str, default: Any = "") -> Any:
+        return secrets.get(name, default)
 
     monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: home)
     monkeypatch.setattr(hermes_cfg, "load_config_readonly", lambda: copy.deepcopy(cfg_state))
@@ -204,10 +214,25 @@ def isolated_hermes(monkeypatch, tmp_path):
     monkeypatch.setattr(hermes_cfg, "update_user_config", _update_user_config, raising=False)
     monkeypatch.setattr(hermes_cfg, "is_managed", lambda: False, raising=False)
     monkeypatch.setattr(
-        router_mod,
-        "get_secret",
-        lambda name, default="": secrets.get(name, default),
+        hermes_cfg,
+        "save_env_value_secure",
+        lambda k, v: secrets.__setitem__(k, v) or {"saved": True},
+        raising=False,
     )
+    monkeypatch.setattr(
+        hermes_cfg,
+        "save_env_value",
+        lambda k, v, env_path=None: secrets.__setitem__(k, v),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        hermes_cfg,
+        "remove_env_value",
+        lambda k: secrets.pop(k, None) is not None,
+        raising=False,
+    )
+    monkeypatch.setattr(ss_mod, "get_secret", _fake_get_secret)
+    monkeypatch.setattr(store_mod, "get_secret", _fake_get_secret)
     router_mod.reset_runtime_caches()
 
     return {

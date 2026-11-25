@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Mapping
 
-from agent.delegation_provider import DelegationProvider
+from agent.delegation_provider import DelegationProvider, DelegationRouteError
 
 from . import decider_router, store
 
@@ -25,6 +25,8 @@ PARAMETER = "option"
 
 class DeciderDelegationProvider(DelegationProvider):
     """Pluggable ``delegation.backend: decider`` provider."""
+
+    display_name = "System-1 Decider"
 
     @property
     def name(self) -> str:
@@ -38,6 +40,17 @@ class DeciderDelegationProvider(DelegationProvider):
         # Must not perform network I/O: an unreachable /v1/systemone server degrades gracefully
         # to the configured default route at spawn time rather than bricking delegate_task.
         return True
+
+    def snapshot_settings(self, config: Mapping[str, Any]) -> dict[str, Any]:
+        _, block = store.active_routes_block(config)
+        frozen: dict[str, Any] = {}
+        raw_opts = block.get("options") if isinstance(block.get("options"), list) else block.get("routes")
+        if isinstance(raw_opts, list):
+            frozen["options"] = [dict(item) for item in raw_opts if isinstance(item, Mapping)]
+        default = store.route_default(config)
+        if default:
+            frozen["default"] = default
+        return frozen
 
     def task_parameters(self, config: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
         options = store.configured_options(config)
@@ -81,25 +94,24 @@ class DeciderDelegationProvider(DelegationProvider):
             return {}
 
         chosen_raw = task.get(PARAMETER)
-        chosen = chosen_raw.strip() if isinstance(chosen_raw, str) else ""
+        explicit = chosen_raw.strip() if isinstance(chosen_raw, str) else ""
+        if explicit and explicit not in options:
+            raise DelegationRouteError(
+                f"delegation option {explicit!r} is no longer configured; "
+                f"available options: {', '.join(options)}"
+            )
 
+        chosen = explicit
         if not chosen and store.decider_enabled():
-            decided = decider_router.route_single_task(task)
+            decided = decider_router.route_single_task(task, section=config)
             if decided and decided in options:
                 chosen = decided
 
         if not chosen:
             chosen = store.route_default(config)
 
-        if not chosen:
+        if not chosen or chosen not in options:
             return {}
-
-        if chosen not in options:
-            logger.warning("decider: route %r is no longer in configured options; using default route.", chosen)
-            fallback_default = store.route_default(config)
-            if not fallback_default or fallback_default not in options:
-                return {}
-            chosen = fallback_default
 
         route = options[chosen]["route"]
         return {**route, "label": chosen}

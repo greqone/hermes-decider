@@ -16,8 +16,8 @@ Works both as a standalone `delegation.backend: decider` provider **and** alongs
 Built specifically as a self-contained catalog plugin with strict local-first defaults:
 
 - **Local-only by default (`allow_fallback: false`, `fallback_url: ""`).** Task text goes only to your configured `/v1/systemone` endpoint (`http://127.0.0.1:11434/v1/systemone` by default) and never leaves your machine unless you explicitly opt in to a secondary fallback URL.
-- **Zero environment variables & zero `.env` parsing.** The plugin never touches `os.environ` or reads `.env` files. Optional `DECIDER_API_KEY` is declared as `type: secret` in `plugin.yaml` and read exclusively via Hermes's `agent.secret_scope.get_secret`.
-- **Host-locked credentials.** When `DECIDER_API_KEY` is set for an authenticated non-local endpoint, the `Authorization: Bearer` header is attached **only** when the request host matches your configured endpoint host, and requests run through `hermes_cli.urllib_security.open_credentialed_url` so cross-origin redirects strip credentials.
+- **Zero environment variables & zero `.env` parsing.** The plugin never touches `os.environ` or reads `.env` files. Optional `DECIDER_API_KEY` (primary HTTPS endpoint) and `DECIDER_FALLBACK_API_KEY` (secondary HTTPS fallback endpoint) are declared as `type: secret` in `plugin.yaml`, read exclusively via Hermes's `agent.secret_scope.get_secret` (propagating `UnscopedSecretError`), and managed via Hermes's unified credential lifecycle (`hermes_cli.config.save_env_value_secure` / `remove_env_value`).
+- **Host-locked, HTTPS-enforced credentials.** Bearer headers are strictly bound to their configured endpoint hostname, never sent to local/LAN Ollama servers, never sent over cleartext `http://` off localhost/loopback, never shared across distinct remote primary and fallback hosts, and stripped on cross-origin redirects via `hermes_cli.urllib_security.open_credentialed_url`.
 - **Graceful fallback.** If the local decision server is asleep or unreachable, tasks degrade cleanly to your configured `default` route without failing `delegate_task`.
 
 ---
@@ -46,6 +46,8 @@ Requires Hermes `>=0.22.5`.
 hermes decider                          # interactive TUI configurator
 hermes decider --show                   # print current settings & eligible routes
 hermes decider --url http://127.0.0.1:11434/v1/systemone --model pplx-decider:27b-nvfp4
+hermes decider --set-fallback-key       # securely prompt for DECIDER_FALLBACK_API_KEY (never on argv)
+hermes decider --allow-fallback --fallback-url https://your-fallback.example/v1/systemone --fallback-model jev-latest
 hermes decider --test "Analyze screenshot.png and list layout bugs" --images
 hermes decider --history                # view recent routing decisions
 ```
@@ -95,7 +97,7 @@ plugins:
       settings:
         enabled: true
         url: http://127.0.0.1:11434/v1/systemone
-        model: pplx-decider:27b-nvfp4
+        primary_model: pplx-decider:27b-nvfp4
         allow_fallback: false
         specialist_threshold: 0.70
         confidence_threshold: 0.60

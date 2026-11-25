@@ -1,7 +1,7 @@
 name: decider
 label: System-1 Decider
 kind: community
-version: 1.1.0
+version: 1.2.0
 author: greqone
 homepage: https://github.com/greqone/hermes-decider
 description: >
@@ -10,8 +10,9 @@ description: >
   route choice) against your local decision server (e.g. Ollama `pplx-decider:27b-nvfp4`),
   both as a standalone `delegation.backend: decider` and alongside `model_map` routes. Local-only
   by default (fallback off, zero environment variables, zero manual `.env` reads; optional
-  `DECIDER_API_KEY` read via `agent.secret_scope.get_secret`). Ships CLI (`hermes decider`),
-  slash (`/decider`), and Hermes Desktop UI.
+  host-locked HTTPS keys `DECIDER_API_KEY` and `DECIDER_FALLBACK_API_KEY` read exclusively via
+  `agent.secret_scope.get_secret`). Ships CLI (`hermes decider`), slash (`/decider`), and Hermes
+  Desktop UI.
 requires_hermes: ">=0.22.5"
 provides_tools: []
 provides_hooks:
@@ -28,11 +29,16 @@ config_schema:
     default: "http://127.0.0.1:11434/v1/systemone"
     label: Primary /v1/systemone URL
     description: "Local System-1 Decider endpoint (e.g. Ollama serving pplx-decider:27b-nvfp4)."
-  model:
+  primary_model:
     type: str
     default: "pplx-decider:27b-nvfp4"
     label: Primary decision model
     description: "Decision model name sent to the primary endpoint."
+  api_key:
+    type: secret
+    env: DECIDER_API_KEY
+    label: Primary endpoint API key
+    description: "Optional Bearer token for an authenticated HTTPS primary endpoint (never sent to local Ollama or fallback hosts)."
   allow_fallback:
     type: bool
     default: false
@@ -48,11 +54,11 @@ config_schema:
     default: "jev-latest"
     label: Fallback decision model
     description: "Decision model name sent to the fallback endpoint when allow_fallback is true."
-  api_key:
+  fallback_api_key:
     type: secret
-    env: DECIDER_API_KEY
-    label: Endpoint API key
-    description: "Optional Bearer token stored by Hermes (.env) and sent only to your configured non-local endpoint host."
+    env: DECIDER_FALLBACK_API_KEY
+    label: Fallback endpoint API key
+    description: "Optional Bearer token dedicated strictly to fallback_url over HTTPS (never sent to other hosts)."
   specialist_threshold:
     type: float
     default: 0.70

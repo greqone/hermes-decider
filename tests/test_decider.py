@@ -24,8 +24,8 @@ class _FakeHTTPResponse:
     def __init__(self, payload: dict[str, Any]):
         self._bytes = json.dumps(payload).encode("utf-8")
 
-    def read(self) -> bytes:
-        return self._bytes
+    def read(self, amt: int | None = None) -> bytes:
+        return self._bytes if amt is None else self._bytes[:amt]
 
     def __enter__(self):
         return self
@@ -189,7 +189,7 @@ def test_opt_in_fallback_attaches_key_only_to_configured_nonlocal_host(monkeypat
     assert "criterion" in calls[1][2]["questions"]["t0_needs_specialist"]
 
 
-def test_bearer_key_never_attached_when_host_mismatches():
+def test_bearer_key_never_attached_when_host_mismatches_or_plain_http():
     req = urllib.request.Request("https://evil.example.net/v1/systemone", method="POST")
     router_mod.attach_bearer_if_allowed(
         req,
@@ -197,6 +197,99 @@ def test_bearer_key_never_attached_when_host_mismatches():
         api_key="super-secret",
     )
     assert req.get_header("Authorization") is None
+
+    # Cleartext http:// off loopback must NEVER carry Authorization header
+    cleartext_req = urllib.request.Request("http://decider.example.com/v1/systemone", method="POST")
+    router_mod.attach_bearer_if_allowed(
+        cleartext_req,
+        configured_url="http://decider.example.com/v1/systemone",
+        api_key="super-secret",
+    )
+    assert cleartext_req.get_header("Authorization") is None
+
+
+def test_distinct_remote_primary_and_fallback_keys_never_cross_contaminate(monkeypatch, isolated_hermes):
+    calls: list[tuple[str, dict[str, str]]] = []
+
+    def fake_open(req: urllib.request.Request, timeout: float = 18.0):
+        headers = {k.lower(): v for k, v in req.header_items()}
+        calls.append((req.full_url, headers))
+        if "primary.example.com" in req.full_url:
+            raise urllib.error.URLError("primary down")
+        return _FakeHTTPResponse({
+            "model": "jev-latest",
+            "decisions": {
+                "t0_needs_specialist": {"yes_probability": 0.91},
+                "t0_route": {"choice": "FrontierOpenAI", "confidence": 0.87},
+            },
+        })
+
+    monkeypatch.setattr(router_mod, "_open_url", fake_open)
+    isolated_hermes["secrets"]["DECIDER_API_KEY"] = "pri-token-111"
+    isolated_hermes["config"]["plugins"]["entries"]["decider"]["settings"].update({
+        "url": "https://primary.example.com/v1/systemone",
+        "allow_fallback": True,
+        "fallback_url": "https://fallback.example.com/v1/systemone",
+        "fallback_model": "jev-latest",
+    })
+
+    # Without DECIDER_FALLBACK_API_KEY, primary's remote key MUST NOT be sent to fallback.example.com!
+    tasks = [{"goal": "Audit cryptographic state transitions"}]
+    assigned = router_mod.route_unassigned_tasks(tasks)
+    assert assigned == {}
+    assert len(calls) == 1
+    assert calls[0][1].get("authorization") == "Bearer pri-token-111"
+
+    # Now set dedicated DECIDER_FALLBACK_API_KEY: each host gets ONLY its own key!
+    calls.clear()
+    router_mod.reset_runtime_caches()
+    isolated_hermes["secrets"]["DECIDER_FALLBACK_API_KEY"] = "fb-token-222"
+    tasks2 = [{"goal": "Audit cryptographic state transitions"}]
+    assigned2 = router_mod.route_unassigned_tasks(tasks2)
+    assert assigned2 == {0: "FrontierOpenAI"}
+    assert len(calls) == 2
+    assert calls[0][1].get("authorization") == "Bearer pri-token-111"
+    assert calls[1][1].get("authorization") == "Bearer fb-token-222"
+
+
+def test_unscoped_secret_error_propagates_fail_closed(monkeypatch):
+    def _raise_unscoped(name: str, default: str = "") -> str:
+        raise store_mod.UnscopedSecretError("secret_scope is not bound")
+
+    monkeypatch.setattr(store_mod, "get_secret", _raise_unscoped)
+    with pytest.raises(store_mod.UnscopedSecretError):
+        router_mod.route_unassigned_tasks([{"goal": "Test unscoped"}])
+
+
+def test_validation_rejects_nan_embedded_credentials_and_cleartext_remote_keys(isolated_hermes):
+    assert store_mod.validate_decider({"specialist_threshold": float("nan")})
+    assert store_mod.validate_decider({"timeout": float("inf")})
+    assert store_mod.validate_decider({"url": "https://user:secret@decider.example.com/v1/systemone"})
+    assert store_mod.display_url("https://user:secret@decider.example.com:8443/v1/systemone") == (
+        "https://decider.example.com:8443/v1/systemone"
+    )
+    assert store_mod.validate_decider(
+        {"allow_fallback": True, "fallback_url": "http://decider.example.com/v1/systemone"},
+        has_fallback_key=True,
+    )
+    # Saving legacy `model` key migrates cleanly to `primary_model` with no reserved `model` key left
+    store_mod.save_decider({"model": "custom-decider:9b"})
+    raw_saved = isolated_hermes["config"]["plugins"]["entries"]["decider"]["settings"]
+    assert "model" not in raw_saved
+    assert raw_saved["primary_model"] == "custom-decider:9b"
+
+
+def test_concurrent_decision_logging_is_thread_safe():
+    import concurrent.futures
+
+    def _writer(i: int) -> None:
+        router_mod._record_decision({"goal": f"task-{i}", "route": "FastSub", "action": "kept_default"})
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(_writer, range(40)))
+
+    rows = router_mod.read_decision_log(limit=100)
+    assert len(rows) == 40
 
 
 def test_delegation_provider_routes_both_explicit_and_unassigned_tasks(monkeypatch, isolated_hermes):
@@ -223,6 +316,10 @@ def test_delegation_provider_routes_both_explicit_and_unassigned_tasks(monkeypat
     explicit = prov.route_task({"goal": "Quick run", "option": "UltraFastPaid"}, section)
     assert explicit["model"] == "deepseek-v4.1-flash"
     assert explicit["label"] == "UltraFastPaid"
+
+    from agent.delegation_provider import DelegationRouteError
+    with pytest.raises(DelegationRouteError):
+        prov.route_task({"goal": "Removed route", "option": "NonExistentRoute"}, section)
 
     auto = prov.route_task({"goal": "Prove deadlock freedom of lock-free ring buffer"}, section)
     assert auto["model"] == "gpt-5.4"

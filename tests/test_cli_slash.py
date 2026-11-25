@@ -47,6 +47,28 @@ def test_cli_rejects_enabling_fallback_without_url(capsys):
     assert "Fallback URL is required" in err
 
 
+def test_cli_stdin_secret_set_and_clear(monkeypatch, capsys, isolated_hermes):
+    import io
+    monkeypatch.setattr("sys.stdin", io.StringIO("cli-fallback-token-999\n"))
+    rc = cli_mod.handle(
+        _parse([
+            "--set-fallback-key",
+            "--allow-fallback",
+            "--fallback-url", "https://decider.example.com/v1/systemone",
+        ])
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "[key: set]" in out
+    assert "cli-fallback-token-999" not in out
+    assert isolated_hermes["secrets"]["DECIDER_FALLBACK_API_KEY"] == "cli-fallback-token-999"
+
+    rc_clear = cli_mod.handle(_parse(["--no-fallback", "--clear-fallback-key"]))
+    assert rc_clear == 0
+    capsys.readouterr()
+    assert "DECIDER_FALLBACK_API_KEY" not in isolated_hermes["secrets"]
+
+
 def test_slash_status_toggle_probe_history_and_mode(monkeypatch):
     status = slash_mod.handle("status")
     assert "System-1 Decider auto-router: ON" in status

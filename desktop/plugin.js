@@ -119,11 +119,13 @@ export function toForm(decider) {
   return {
     enabled: d.enabled !== false,
     url: d.url ?? '',
-    model: d.model ?? '',
+    primary_model: d.primary_model ?? d.model ?? '',
+    api_key: '',
     // Off by default: task text never leaves the machine unless explicitly opted in.
     allow_fallback: Boolean(d.allow_fallback),
     fallback_url: d.fallback_url ?? '',
     fallback_model: d.fallback_model ?? '',
+    fallback_api_key: '',
     specialist_threshold: String(d.specialist_threshold ?? 0.7),
     confidence_threshold: String(d.confidence_threshold ?? 0.6),
     timeout: String(d.timeout ?? 18),
@@ -136,16 +138,25 @@ export function toPayload(form) {
     const text = String(value ?? '').trim().replace(',', '.')
     return text !== '' && Number.isFinite(Number(text)) ? Number(text) : text
   }
-  return {
-    ...form,
-    url: form.url.trim(),
-    model: form.model.trim(),
-    fallback_url: form.fallback_url.trim(),
-    fallback_model: form.fallback_model.trim(),
+  const out = {
+    enabled: Boolean(form.enabled),
+    url: String(form.url ?? '').trim(),
+    primary_model: String(form.primary_model ?? form.model ?? '').trim(),
+    allow_fallback: Boolean(form.allow_fallback),
+    fallback_url: String(form.fallback_url ?? '').trim(),
+    fallback_model: String(form.fallback_model ?? '').trim(),
     specialist_threshold: num(form.specialist_threshold),
     confidence_threshold: num(form.confidence_threshold),
-    timeout: num(form.timeout)
+    timeout: num(form.timeout),
+    excluded_options: Array.isArray(form.excluded_options) ? [...form.excluded_options] : []
   }
+  const priKey = String(form.api_key ?? '').trim()
+  if (priKey) out.api_key = priKey
+  if (form.clear_api_key === true) out.clear_api_key = true
+  const fbKey = String(form.fallback_api_key ?? '').trim()
+  if (fbKey) out.fallback_api_key = fbKey
+  if (form.clear_fallback_api_key === true) out.clear_fallback_api_key = true
+  return out
 }
 
 const fixed = value => Number(value || 0).toFixed(2)
@@ -166,6 +177,30 @@ function TextRow({ title, description, value, onChange, style = FIELD, ...props 
     title,
     description,
     action: jsx(Input, { 'aria-label': title, value, style, onChange: e => onChange(e.currentTarget.value), ...props })
+  })
+}
+
+function SecretRow({ title, description, hasKey, envName, value, disabled, onChange, onClear }) {
+  return jsx(ListRow, {
+    title: jsxs('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 6 }, children: [
+      title,
+      hasKey ? jsx(Badge, { variant: 'success', children: 'Saved' }) : null
+    ] }),
+    description,
+    action: jsxs('div', { style: S.actions, children: [
+      jsx(Input, {
+        'aria-label': title,
+        type: 'password',
+        autoComplete: 'off',
+        placeholder: hasKey ? `Stored in ${envName} (paste to replace)` : `Paste Bearer key (${envName})`,
+        value,
+        style: FIELD,
+        onChange: e => onChange(e.currentTarget.value)
+      }),
+      hasKey
+        ? jsx(Button, { size: 'sm', variant: 'ghost', disabled, onClick: onClear, children: 'Clear key' })
+        : null
+    ] })
   })
 }
 
@@ -249,7 +284,19 @@ export function DeciderSettings() {
           onChange: on => commit({ enabled: on })
         }),
         jsx(TextRow, { title: 'Endpoint', description: 'Your local /v1/systemone server (e.g. Ollama).', value: form.url, onChange: url => edit({ url }) }),
-        jsx(TextRow, { title: 'Decision model', value: form.model, onChange: model => edit({ model }) }),
+        jsx(TextRow, { title: 'Decision model', value: form.primary_model, onChange: primary_model => edit({ primary_model }) }),
+        String(form.url || '').trim().toLowerCase().startsWith('https://') || Boolean(data.decider?.has_api_key)
+          ? jsx(SecretRow, {
+              title: 'Primary API key',
+              description: 'Host-locked Bearer token for an HTTPS primary endpoint (never sent to local Ollama or fallback).',
+              hasKey: Boolean(data.decider?.has_api_key),
+              envName: 'DECIDER_API_KEY',
+              value: form.api_key,
+              disabled: save.isPending,
+              onChange: api_key => edit({ api_key }),
+              onClear: () => commit({ clear_api_key: true, api_key: '' })
+            })
+          : null,
         jsx(ToggleRow, {
           label: 'Secondary fallback (opt-in)',
           description: 'Off by default. Sends task text to the fallback URL only when the primary endpoint fails.',
@@ -258,10 +305,22 @@ export function DeciderSettings() {
           onChange: on => edit({ allow_fallback: on })
         }),
         form.allow_fallback
-          ? jsx(TextRow, { title: 'Fallback endpoint', description: 'Set DECIDER_API_KEY in Agent settings when using an authenticated remote host.', value: form.fallback_url, onChange: fallback_url => edit({ fallback_url }) })
+          ? jsx(TextRow, { title: 'Fallback endpoint', description: 'HTTPS /v1/systemone endpoint used only when the primary server is unreachable.', value: form.fallback_url, onChange: fallback_url => edit({ fallback_url }) })
           : null,
         form.allow_fallback
           ? jsx(TextRow, { title: 'Fallback model', value: form.fallback_model, onChange: fallback_model => edit({ fallback_model }) })
+          : null,
+        form.allow_fallback
+          ? jsx(SecretRow, {
+              title: 'Fallback API key',
+              description: 'Host-locked Bearer token dedicated strictly to Fallback endpoint over HTTPS.',
+              hasKey: Boolean(data.decider?.has_fallback_api_key),
+              envName: 'DECIDER_FALLBACK_API_KEY',
+              value: form.fallback_api_key,
+              disabled: save.isPending,
+              onChange: fallback_api_key => edit({ fallback_api_key }),
+              onClear: () => commit({ clear_fallback_api_key: true, fallback_api_key: '' })
+            })
           : null,
         jsx(TextRow, {
           title: 'Specialist threshold',

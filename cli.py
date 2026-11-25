@@ -9,6 +9,7 @@ Supports non-interactive flags (``--show``, ``--enable``, ``--disable``, ``--url
 
 from __future__ import annotations
 
+import getpass
 import sys
 from typing import Any, Mapping
 
@@ -23,6 +24,26 @@ def setup_parser(parser) -> None:
     parser.add_argument("--model", type=str, default=None, help="Primary decision model name")
     parser.add_argument("--fallback-url", type=str, default=None, help="Optional secondary /v1/systemone URL")
     parser.add_argument("--fallback-model", type=str, default=None, help="Secondary decision model name")
+    parser.add_argument(
+        "--set-fallback-key",
+        action="store_true",
+        help="Prompt securely (or read one line from stdin) to store DECIDER_FALLBACK_API_KEY",
+    )
+    parser.add_argument(
+        "--clear-fallback-key",
+        action="store_true",
+        help="Remove saved DECIDER_FALLBACK_API_KEY",
+    )
+    parser.add_argument(
+        "--set-key",
+        action="store_true",
+        help="Prompt securely (or read one line from stdin) to store DECIDER_API_KEY for an HTTPS primary endpoint",
+    )
+    parser.add_argument(
+        "--clear-key",
+        action="store_true",
+        help="Remove saved DECIDER_API_KEY",
+    )
     parser.add_argument(
         "--allow-fallback",
         dest="allow_fallback",
@@ -103,16 +124,27 @@ def describe_status(cfg: Mapping[str, Any] | None = None) -> str:
     excluded = set(dec["excluded_options"])
     eligible = [n for n in opt_names if n not in excluded]
     state_str = "ON" if dec["enabled"] else "OFF"
-    fb_str = (
-        f"{dec['fallback_model']} @ {dec['fallback_url']}"
-        if dec["allow_fallback"] and dec["fallback_url"]
-        else "disabled (local-only)"
-    )
+    try:
+        has_pri_key = bool(store.primary_api_key())
+        has_fb_key = bool(store.effective_fallback_api_key(dec["url"]))
+    except store.UnscopedSecretError:
+        has_pri_key = False
+        has_fb_key = False
+    pri_key_tag = " (key: set)" if has_pri_key and not store.is_ollama_endpoint(dec["url"]) else ""
+    if dec["allow_fallback"] and dec["fallback_url"]:
+        fb_key_tag = (
+            ""
+            if store.is_ollama_endpoint(dec["fallback_url"])
+            else (" [key: set]" if has_fb_key else " [key: NOT SET]")
+        )
+        fb_str = f"{dec['fallback_model']} @ {store.display_url(dec['fallback_url'])}{fb_key_tag}"
+    else:
+        fb_str = "disabled (local-only)"
     lines = [
         f"System-1 Decider auto-router: {state_str}",
         f"  Delegation backend:   {mode} ({store.mode_label(mode)})",
-        f"  Primary endpoint:     {dec['url']}",
-        f"  Primary model:        {dec['model']}",
+        f"  Primary endpoint:     {store.display_url(dec['url'])}{pri_key_tag}",
+        f"  Primary model:        {dec['primary_model']}",
         f"  Secondary fallback:   {fb_str}",
         f"  Thresholds:           specialist >= {dec['specialist_threshold']:.2f}, confidence >= {dec['confidence_threshold']:.2f}",
         f"  Timeout:              {dec['timeout']:.1f}s",
@@ -137,6 +169,12 @@ def _print_probe_result(res: Mapping[str, Any]) -> int:
     return 0
 
 
+def _read_secret_interactive_or_stdin(env_name: str) -> str:
+    if sys.stdin.isatty():
+        return getpass.getpass(f"Enter {env_name} (input hidden): ").strip()
+    return sys.stdin.readline().strip()
+
+
 def handle(args) -> int:
     if getattr(args, "clear_history", False):
         removed = decider_router.clear_decision_log()
@@ -158,6 +196,24 @@ def handle(args) -> int:
             )
         return 0
 
+    secret_changed = False
+    try:
+        if getattr(args, "clear_key", False):
+            store.clear_secret(store.PRIMARY_KEY_ENV)
+            secret_changed = True
+        if getattr(args, "clear_fallback_key", False):
+            store.clear_secret(store.FALLBACK_KEY_ENV)
+            secret_changed = True
+        if getattr(args, "set_key", False):
+            store.save_secret(store.PRIMARY_KEY_ENV, _read_secret_interactive_or_stdin(store.PRIMARY_KEY_ENV))
+            secret_changed = True
+        if getattr(args, "set_fallback_key", False):
+            store.save_secret(store.FALLBACK_KEY_ENV, _read_secret_interactive_or_stdin(store.FALLBACK_KEY_ENV))
+            secret_changed = True
+    except (ValueError, RuntimeError) as exc:
+        print(f"✗ {exc}", file=sys.stderr)
+        return 2
+
     cfg = store.full_config()
     current = dict(store.decider_settings(cfg))
     changed = False
@@ -172,7 +228,7 @@ def handle(args) -> int:
         current["url"] = args.url.strip()
         changed = True
     if getattr(args, "model", None) is not None:
-        current["model"] = args.model.strip()
+        current["primary_model"] = args.model.strip()
         changed = True
     if getattr(args, "fallback_url", None) is not None:
         current["fallback_url"] = args.fallback_url.strip()
@@ -222,7 +278,7 @@ def handle(args) -> int:
         )
         return _print_probe_result(res)
 
-    if getattr(args, "show", False) or changed or target_mode or not sys.stdin.isatty():
+    if getattr(args, "show", False) or changed or secret_changed or target_mode or not sys.stdin.isatty():
         print(describe_status())
         return 0
 
@@ -242,14 +298,14 @@ def _interactive_menu() -> int:
         dec = dict(store.decider_settings(cfg))
         mode = store.current_mode(cfg)
         fb_status = (
-            f"ON ({dec['fallback_model']} @ {dec['fallback_url']})"
+            f"ON ({dec['fallback_model']} @ {store.display_url(dec['fallback_url'])})"
             if dec["allow_fallback"] and dec["fallback_url"]
             else "OFF (local-only)"
         )
         choices = [
             f"Auto-routing:           {'ON' if dec['enabled'] else 'OFF'}",
             f"Delegation backend:     {mode} ({store.mode_label(mode)})",
-            f"Primary endpoint & mdl: {dec['model']} @ {dec['url']}",
+            f"Primary endpoint & mdl: {dec['primary_model']} @ {store.display_url(dec['url'])}",
             f"Secondary fallback:     {fb_status}",
             f"Thresholds & timeout:   specialist>={dec['specialist_threshold']:.2f}, conf>={dec['confidence_threshold']:.2f}, {dec['timeout']:.0f}s",
             f"Excluded routes:        {', '.join(dec['excluded_options']) if dec['excluded_options'] else '(none)'}",
@@ -279,7 +335,7 @@ def _interactive_menu() -> int:
                 store.set_mode(modes[pick])
         elif idx == 2:
             dec["url"] = prompt("Primary /v1/systemone URL", default=dec["url"]).strip() or dec["url"]
-            dec["model"] = prompt("Primary decision model", default=dec["model"]).strip() or dec["model"]
+            dec["primary_model"] = prompt("Primary decision model", default=dec["primary_model"]).strip() or dec["primary_model"]
             problems = store.validate_decider(dec)
             if problems:
                 print("✗ " + " ".join(problems))
@@ -293,10 +349,20 @@ def _interactive_menu() -> int:
             )
             if toggle == 1:
                 dec["allow_fallback"] = True
-                dec["fallback_url"] = prompt("Fallback /v1/systemone URL", default=dec["fallback_url"]).strip()
+                dec["fallback_url"] = prompt("Fallback /v1/systemone URL (https://...)", default=dec["fallback_url"]).strip()
                 dec["fallback_model"] = (
                     prompt("Fallback model", default=dec["fallback_model"]).strip() or dec["fallback_model"]
                 )
+                if dec["fallback_url"] and not store.is_ollama_endpoint(dec["fallback_url"]):
+                    raw_key = getpass.getpass(
+                        f"Optional {store.FALLBACK_KEY_ENV} (leave blank to keep current): "
+                    ).strip()
+                    if raw_key:
+                        try:
+                            store.save_secret(store.FALLBACK_KEY_ENV, raw_key)
+                        except (ValueError, RuntimeError) as exc:
+                            print(f"✗ {exc}")
+                            continue
             elif toggle == 0:
                 dec["allow_fallback"] = False
             problems = store.validate_decider(dec)
