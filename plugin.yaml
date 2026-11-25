@@ -1,38 +1,70 @@
 name: decider
-label: Decider
+label: System-1 Decider
 kind: community
-version: 1.0.0
+version: 1.1.0
 author: greqone
 homepage: https://github.com/greqone/hermes-decider
 description: >
-  A delegation backend that asks one local decision model which configured route a subagent should
-  run on. Set delegation.backend to "decider". It calls a single /v1/systemone endpoint you name,
-  the model answers with one of your route names, and the plugin maps that name to the route. If
-  the endpoint is down or the answer is not one of your routes, the task takes the route you marked
-  default. It never falls back to a second host, so task text leaves the machine only for the
-  endpoint you configured.
+  System-1 Decider auto-router for Hermes subagent delegation (`/v1/systemone`). Evaluates
+  unassigned `delegate_task` spawns in a single batched forward pass (noul specialist gate +
+  route choice) against your local decision server (e.g. Ollama `pplx-decider:27b-nvfp4`),
+  both as a standalone `delegation.backend: decider` and alongside `model_map` routes. Local-only
+  by default (fallback off, zero environment variables, zero manual `.env` reads; optional
+  `DECIDER_API_KEY` read via `agent.secret_scope.get_secret`). Ships CLI (`hermes decider`),
+  slash (`/decider`), and Hermes Desktop UI.
 requires_hermes: ">=0.22.5"
 provides_tools: []
-provides_hooks: []
+provides_hooks:
+  - pre_tool_call
 requires_env: []
 config_schema:
-  endpoint:
+  enabled:
+    type: bool
+    default: true
+    label: Auto-route unassigned subagents
+    description: "Route delegate_task items that omit `option` via your /v1/systemone endpoint."
+  url:
     type: str
     default: "http://127.0.0.1:11434/v1/systemone"
-    label: Decision endpoint
-    description: "The only host ever called. A bearer key, if you set one, is sent only to this exact host."
+    label: Primary /v1/systemone URL
+    description: "Local System-1 Decider endpoint (e.g. Ollama serving pplx-decider:27b-nvfp4)."
   model:
     type: str
     default: "pplx-decider:27b-nvfp4"
-    label: Decision model
-    description: "Model name sent to the endpoint."
-  timeout_s:
-    type: float
-    default: 18.0
-    label: Timeout (seconds)
-    description: "How long one decision may take before the task uses the default route."
+    label: Primary decision model
+    description: "Decision model name sent to the primary endpoint."
+  allow_fallback:
+    type: bool
+    default: false
+    label: Secondary fallback endpoint (opt-in)
+    description: "Off by default so task text never leaves the machine unless you explicitly enable a secondary URL."
+  fallback_url:
+    type: str
+    default: ""
+    label: Fallback /v1/systemone URL
+    description: "Optional secondary /v1/systemone endpoint used only when allow_fallback is true."
+  fallback_model:
+    type: str
+    default: "jev-latest"
+    label: Fallback decision model
+    description: "Decision model name sent to the fallback endpoint when allow_fallback is true."
   api_key:
     type: secret
     env: DECIDER_API_KEY
-    label: Endpoint key
-    description: "Optional. Sent as a bearer token, and only to the host in endpoint. Leave empty for a local model."
+    label: Endpoint API key
+    description: "Optional Bearer token stored by Hermes (.env) and sent only to your configured non-local endpoint host."
+  specialist_threshold:
+    type: float
+    default: 0.70
+    label: Specialist threshold (0-1)
+    description: "Minimum noul probability required before upgrading away from the default route."
+  confidence_threshold:
+    type: float
+    default: 0.60
+    label: Route confidence threshold (0-1)
+    description: "Minimum choice confidence required for the selected specialist route."
+  timeout:
+    type: float
+    default: 18.0
+    label: Request timeout (seconds)
+    description: "HTTP timeout per /v1/systemone decision request (1-120s)."
